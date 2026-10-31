@@ -595,21 +595,28 @@
       if (!file) return;
 
       const reader = new FileReader();
-      reader.onload = function(e) {
+      reader.onload = async function(e) {
         try {
           const dadosImportados = JSON.parse(e.target.result);
           if (Array.isArray(dadosImportados)) {
-            categorias = dadosImportados;
+            // Normaliza cada bloco e seus favoritos para manter compatibilidade
+            categorias = dadosImportados.map(b => ({
+              id: b.id || ('bloco_' + Date.now() + '_' + Math.random().toString(36).substr(2, 4)),
+              titulo: b.titulo || 'Novo Bloco',
+              favoritos: Array.isArray(b.favoritos) ? b.favoritos : []
+            }));
+
+            // Salva localmente e propaga para o Drive se logado
             salvarDadosLocais();
             renderizarBlocos();
-            mostrarToast("Backup importado com sucesso!");
-            fecharModalSync();
+            mostrarToast("Backup importado e sincronizado!");
             document.getElementById('backupDropdown').classList.add('hidden');
           } else {
-            alert("O arquivo selecionado não contém um formato de backup válido.");
+            mostrarToast("O arquivo não possui o formato de lista de blocos válido.");
           }
         } catch (err) {
-          alert("Erro ao ler o arquivo JSON: " + err.message);
+          console.error("Erro na importação JSON:", err);
+          mostrarToast("Erro ao importar o arquivo JSON");
         }
       };
       reader.readAsText(file);
