@@ -1,0 +1,26 @@
+/* Configurações de cores customizadas para o Tailwind */
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* Estilização suave para scrollbar */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+::-webkit-scrollbar-track {
+  background: #090d16;
+}
+::-webkit-scrollbar-thumb {
+  background: #1f2937;
+  border-radius: 9999px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #374151;
+}
+
+/* Efeito de desfoque de fundo */
+.custom-backdrop {
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+}
