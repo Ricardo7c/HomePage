@@ -75,6 +75,7 @@
             <p class="text-xs text-slate-400">Dashboard pessoal de favoritos</p>
           </div>
         </div>
+      </div>
 
       <!-- Barra de Busca Central com Seletor de Motor -->
       <div class="w-full md:max-w-xl relative">
@@ -426,6 +427,7 @@
     // Estado Geral da Aplicação
     let categorias = [];
     let googleAccessToken = null;
+    let tokenClient = null;
     let driveFileId = null;
     let filtroAtual = "";
     let motorBuscaAtivo = "ddg"; // 'ddg' (DuckDuckGo) ou 'google'
@@ -437,6 +439,7 @@
       carregarPreferenciasMotor();
       carregarDadosLocais();
       renderizarBlocos();
+      verificarSessaoSalvaDrive();
     });
 
     function carregarDadosLocais() {
@@ -444,7 +447,6 @@
       const versaoSalva = localStorage.getItem('homepage_dados_versao');
       const salvo = localStorage.getItem('homepage_dados');
 
-      // Se for a primeira vez recebendo essa nova lista de blocos, atualiza automaticamente
       if (versaoSalva !== versaoLista) {
         categorias = JSON.parse(JSON.stringify(DADOS_INICIAIS));
         localStorage.setItem('homepage_dados_versao', versaoLista);
@@ -467,7 +469,6 @@
 
     function salvarDadosLocais() {
       localStorage.setItem('homepage_dados', JSON.stringify(categorias));
-      // Se houver token do Google ativo, sincroniza em background
       if (googleAccessToken) {
         sincronizarComDriveSilenciosamente();
       }
@@ -519,7 +520,6 @@
       }
     }
 
-    // Fecha dropdown do motor ao clicar fora
     document.addEventListener('click', (e) => {
       const dropdown = document.getElementById('dropdownMotor');
       const btn = document.getElementById('btnMotorAtivo');
@@ -564,7 +564,6 @@
       dropdown.classList.toggle('hidden');
     }
 
-    // Fecha dropdown de backup ao clicar fora
     document.addEventListener('click', (e) => {
       const dropdown = document.getElementById('backupDropdown');
       const btn = document.getElementById('btnBackupMenu');
@@ -599,14 +598,12 @@
         try {
           const dadosImportados = JSON.parse(e.target.result);
           if (Array.isArray(dadosImportados)) {
-            // Normaliza cada bloco e seus favoritos para manter compatibilidade
             categorias = dadosImportados.map(b => ({
               id: b.id || ('bloco_' + Date.now() + '_' + Math.random().toString(36).substr(2, 4)),
               titulo: b.titulo || 'Novo Bloco',
               favoritos: Array.isArray(b.favoritos) ? b.favoritos : []
             }));
 
-            // Salva localmente e propaga para o Drive se logado
             salvarDadosLocais();
             renderizarBlocos();
             mostrarToast("Backup importado e sincronizado!");
@@ -626,24 +623,93 @@
     function restaurarPadraoComConfirmacao() {
       if (confirm("Deseja restaurar os blocos de demonstração? Isso substituirá sua lista atual.")) {
         categorias = JSON.parse(JSON.stringify(DADOS_INICIAIS));
+        salvarDadosLocais();
+        renderizarBlocos();
         mostrarToast("Dados padrão restaurados!");
         document.getElementById('backupDropdown').classList.add('hidden');
       }
     }
 
     // -------------------------------------------------------------
-    // INTEGRAÇÃO COM GOOGLE DRIVE (OAuth 2.0 + appDataFolder)
+    // INTEGRAÇÃO COM GOOGLE DRIVE (PERSISTENTE COM AUTO-LOGIN)
     // -------------------------------------------------------------
+    function obterTokenClient() {
+      if (!tokenClient && typeof google !== 'undefined' && google.accounts && google.accounts.oauth2) {
+        tokenClient = google.accounts.oauth2.initTokenClient({
+          client_id: GOOGLE_CLIENT_ID,
+          scope: 'https://www.googleapis.com/auth/drive.appdata',
+          callback: async (tokenResponse) => {
+            if (tokenResponse.error) {
+              console.warn("Autenticação não pôde ser completada:", tokenResponse.error);
+              if (tokenResponse.error !== "interaction_required") {
+                mostrarToast("Erro na autenticação com o Google");
+              }
+              return;
+            }
+
+            googleAccessToken = tokenResponse.access_token;
+            
+            // Salva token e cálculo de expiração (com margem de 60s)
+            const expiresIn = tokenResponse.expires_in ? parseInt(tokenResponse.expires_in, 10) : 3500;
+            const expiresAt = Date.now() + (expiresIn - 60) * 1000;
+            localStorage.setItem('homepage_drive_token', googleAccessToken);
+            localStorage.setItem('homepage_drive_expires_at', expiresAt.toString());
+            localStorage.setItem('homepage_drive_conectado', 'true');
+
+            atualizarStatusDrive(true);
+            mostrarToast("Conectado ao Google Drive!");
+            await carregarOuSalvarDrive();
+          },
+        });
+      }
+      return tokenClient;
+    }
+
+    async function verificarSessaoSalvaDrive() {
+      const estaConectado = localStorage.getItem('homepage_drive_conectado') === 'true';
+      if (!estaConectado) return;
+
+      const tokenSalvo = localStorage.getItem('homepage_drive_token');
+      const expiresAt = parseInt(localStorage.getItem('homepage_drive_expires_at') || '0', 10);
+      driveFileId = localStorage.getItem('homepage_drive_file_id') || null;
+
+      // Se o token ainda for válido no tempo
+      if (tokenSalvo && Date.now() < expiresAt) {
+        googleAccessToken = tokenSalvo;
+        atualizarStatusDrive(true);
+        carregarOuSalvarDrive();
+        return;
+      }
+
+      // Se expirou, tenta renovar silenciosamente sem abrir pop-up
+      tentarRenovarTokenSilencioso();
+    }
+
+    function tentarRenovarTokenSilencioso() {
+      let tentativas = 0;
+      const intervalo = setInterval(() => {
+        tentativas++;
+        const client = obterTokenClient();
+        if (client) {
+          clearInterval(intervalo);
+          // prompt: '' tenta renovar em background sem interromper o usuário
+          client.requestAccessToken({ prompt: '' });
+        }
+        if (tentativas > 10) {
+          clearInterval(intervalo);
+        }
+      }, 500);
+    }
+
     function acionarLoginGoogleDrive() {
-      // 1. Validação de configuração prévia
       if (!GOOGLE_CLIENT_ID || GOOGLE_CLIENT_ID.includes("SEU_CLIENT_ID_AQUI")) {
         mostrarToast("Configure a constante GOOGLE_CLIENT_ID no código primeiro!");
         return;
       }
 
-      // 2. Se já estiver conectado, oferece desconectar ou sincronizar
+      // Se já estiver logado, oferece sincronizar ou sair
       if (googleAccessToken) {
-        if (confirm("Você já está conectado ao Google Drive.\nDeseja sincronizar agora? (Cancelar para desconectar)")) {
+        if (confirm("Você já está conectado ao Google Drive.\n\n• Clique OK para sincronizar agora\n• Clique Cancelar para SAIR e desconectar a conta")) {
           carregarOuSalvarDrive();
         } else {
           desconectarGoogleDrive();
@@ -651,37 +717,15 @@
         return;
       }
 
-      // 3. Verifica biblioteca oficial do Google
       if (typeof google === 'undefined' || !google.accounts || !google.accounts.oauth2) {
         mostrarToast("Biblioteca do Google ainda carregando. Aguarde alguns segundos...");
         return;
       }
 
-      try {
-        const tokenClient = google.accounts.oauth2.initTokenClient({
-          client_id: GOOGLE_CLIENT_ID,
-          scope: 'https://www.googleapis.com/auth/drive.appdata',
-          callback: async (tokenResponse) => {
-            if (tokenResponse.error) {
-              console.error("Erro OAuth:", tokenResponse);
-              mostrarToast("Erro na autenticação com o Google");
-              return;
-            }
-
-            googleAccessToken = tokenResponse.access_token;
-            atualizarStatusDrive(true);
-            mostrarToast("Conectado ao Google Drive!");
-
-            // Executa carga ou sincronização imediata
-            await carregarOuSalvarDrive();
-          },
-        });
-
-        // Abre a janela de consentimento do Google
-        tokenClient.requestAccessToken();
-      } catch (err) {
-        console.error("Erro ao inicializar Google OAuth:", err);
-        mostrarToast("Falha ao abrir autenticação do Google");
+      const client = obterTokenClient();
+      if (client) {
+        // Abre o consentimento interativo para o primeiro login
+        client.requestAccessToken({ prompt: 'select_account' });
       }
     }
 
@@ -691,16 +735,23 @@
       try {
         mostrarToast("Verificando backup na nuvem...");
 
-        // 1. Procurar se já existe o arquivo na pasta privada appDataFolder
         const query = encodeURIComponent("name = 'favoritos_backup.json' and 'appDataFolder' in parents and trashed = false");
         const listRes = await fetch(`https://www.googleapis.com/drive/v3/files?spaces=appDataFolder&q=${query}&fields=files(id, name)`, {
           headers: { 'Authorization': `Bearer ${googleAccessToken}` }
         });
+
+        // Se o token expirou no meio do caminho, limpa e pede renovação
+        if (listRes.status === 401) {
+          tentarRenovarTokenSilencioso();
+          return;
+        }
+
         const listData = await listRes.json();
 
         if (listData.files && listData.files.length > 0) {
           driveFileId = listData.files[0].id;
-          // Baixa os dados existentes da nuvem
+          localStorage.setItem('homepage_drive_file_id', driveFileId);
+
           const fileRes = await fetch(`https://www.googleapis.com/drive/v3/files/${driveFileId}?alt=media`, {
             headers: { 'Authorization': `Bearer ${googleAccessToken}` }
           });
@@ -715,7 +766,6 @@
           }
         }
 
-        // Se não existir arquivo prévio na nuvem, faz o upload inicial do que está no navegador
         await sincronizarComDriveSilenciosamente();
         mostrarToast("Backup salvo no Google Drive!");
       } catch (e) {
@@ -750,8 +800,16 @@
           body: form
         });
 
+        if (res.status === 401) {
+          tentarRenovarTokenSilencioso();
+          return;
+        }
+
         const data = await res.json();
-        if (data.id) driveFileId = data.id;
+        if (data.id) {
+          driveFileId = data.id;
+          localStorage.setItem('homepage_drive_file_id', driveFileId);
+        }
       } catch (err) {
         console.warn("Falha no salvamento automático no Google Drive:", err);
       }
@@ -771,10 +829,23 @@
     }
 
     function desconectarGoogleDrive() {
+      if (googleAccessToken && typeof google !== 'undefined' && google.accounts && google.accounts.oauth2) {
+        google.accounts.oauth2.revoke(googleAccessToken, () => {
+          console.log("Token revogado no Google.");
+        });
+      }
+
       googleAccessToken = null;
       driveFileId = null;
+
+      // Remove os dados salvos de login
+      localStorage.removeItem('homepage_drive_token');
+      localStorage.removeItem('homepage_drive_expires_at');
+      localStorage.removeItem('homepage_drive_conectado');
+      localStorage.removeItem('homepage_drive_file_id');
+
       atualizarStatusDrive(false);
-      mostrarToast("Desconectado do Google Drive");
+      mostrarToast("Desconectado com sucesso!");
     }
 
     // -------------------------------------------------------------
@@ -795,7 +866,6 @@
 
       const termoBusca = filtroAtual.toLowerCase().trim();
 
-      // Filtra os favoritos ou blocos se houver busca
       const blocosVisiveis = categorias.map(bloco => {
         const listaFavoritos = Array.isArray(bloco.favoritos) ? bloco.favoritos : [];
         const favoritosFiltrados = listaFavoritos.filter(fav => 
@@ -822,7 +892,6 @@
         const card = document.createElement('div');
         card.className = "bg-cardBg border border-borderSubtle hover:border-slate-700/80 rounded-2xl p-4 sm:p-5 shadow-lg transition-all duration-200 flex flex-col";
 
-        // Cabeçalho do Bloco
         const header = document.createElement('div');
         header.className = "flex items-center justify-between pb-3 mb-3 border-b border-borderSubtle/60";
         header.innerHTML = `
@@ -856,7 +925,6 @@
         `;
         card.appendChild(header);
 
-        // Lista de Favoritos do Bloco (modo padrão)
         const lista = document.createElement('div');
         lista.className = "flex flex-col gap-1.5 flex-1";
 
@@ -874,18 +942,14 @@
             const item = document.createElement('div');
             item.className = "group flex items-center justify-between p-2 rounded-xl hover:bg-cardHover border border-transparent hover:border-slate-800 transition-all duration-150";
 
-            // Detecção Automática de Favicon com fallbacks em cascata
             const domain = extrairDominio(fav.url);
             let iconeHtml = '';
             
             if (fav.icone && fav.icone.trim().length <= 4) {
-              // Permite emoji manual caso o usuário ainda queira um personalizado
               iconeHtml = `<span class="w-6 h-6 flex items-center justify-center text-lg shrink-0">${escaparHTML(fav.icone)}</span>`;
             } else if (fav.icone && fav.icone.startsWith('http')) {
-              // URL direta personalizada
               iconeHtml = `<img src="${escaparHTML(fav.icone)}" class="w-5 h-5 rounded object-cover shrink-0" onerror="tratarErroFavicon(this, '${domain}')"/>`;
             } else {
-              // Busca automática de alta resolução com DuckDuckGo e Google como fallback
               const urlDuck = `https://icons.duckduckgo.com/ip3/${domain}.ico`;
               iconeHtml = `<img src="${urlDuck}" alt="" class="w-5 h-5 rounded shrink-0 object-contain" onerror="tratarErroFavicon(this, '${domain}')"/>`;
             }
@@ -932,7 +996,6 @@
     function abrirModalBloco() {
       document.getElementById('editBlocoId').value = '';
       document.getElementById('inputTituloBloco').value = '';
-
       document.getElementById('modalBlocoTitle').innerHTML = '<i class="ph-bold ph-folder-plus text-brand-400"></i> Novo Bloco';
       document.getElementById('modalBloco').classList.remove('hidden');
       setTimeout(() => document.getElementById('inputTituloBloco').focus(), 50);
@@ -948,7 +1011,6 @@
 
       document.getElementById('editBlocoId').value = bloco.id;
       document.getElementById('inputTituloBloco').value = bloco.titulo;
-
       document.getElementById('modalBlocoTitle').innerHTML = '<i class="ph-bold ph-pencil text-brand-400"></i> Renomear Bloco';
       document.getElementById('modalBloco').classList.remove('hidden');
       setTimeout(() => document.getElementById('inputTituloBloco').focus(), 50);
@@ -1116,7 +1178,6 @@
       if (imgElement.src !== fallbackGoogle) {
         imgElement.src = fallbackGoogle;
       } else {
-        // Se ambos falharem, exibe um ícone genérico elegante
         imgElement.outerHTML = '<span class="w-5 h-5 flex items-center justify-center text-slate-500 shrink-0"><i class="ph-bold ph-globe text-base"></i></span>';
       }
     }
